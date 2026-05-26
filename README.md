@@ -18,13 +18,15 @@ Browser ──HTTPS──► Vercel (static React bundle)
    │
    └── WSS ──────► Render (Node + Express + Socket.IO)
                       │
-                      └── MongoDB Atlas: Room { roomId, code, timestamps }
+                      └── MongoDB Atlas: Room { roomId, code, passwordHash, timestamps }
 
 ```
 
 Room state is persisted to MongoDB Atlas, so a room's code survives server restarts and free-tier sleep cycles. Real-time edits are broadcast to all sockets in the room (excluding the sender) over WebSocket; DB writes are debounced at 1 write per second per room to avoid hammering the cluster on every keystroke. Late joiners get the current code via a `findOne` lookup on `join-room`.
 
 Active users (presence) are tracked in-memory per room and broadcast to all sockets on join/leave — deliberately not persisted, since presence is ephemeral by definition. Names are prompted on the landing page and stored in `localStorage`; per-user avatar colors are derived deterministically from each socket's ID via a string hash, so every client agrees on who's which color without server coordination.
+
+Rooms are created explicitly via `POST /api/rooms` with an optional password, which is bcrypt-hashed (cost factor 10) before storage — plaintext is never written or logged. Before opening a socket, the client probes `GET /api/rooms/:id` to learn whether the room exists and whether it needs a password; private rooms show an inline prompt, with the entered password cached in `sessionStorage` (tab-scoped) so the creator's immediate navigate and any in-tab reloads connect without re-prompting. Existing rooms from before this change remain public — `passwordHash` defaults to `null`.
 
 ## Repository Layout
 
@@ -71,7 +73,9 @@ The free tier on Render sleeps after 15 minutes of inactivity; the first request
 - ✅ **Phase 2 (complete):** Public deployment to Vercel + Render with multi-origin CORS, SPA routing, and infrastructure-as-code.
 - ✅ **Phase 3 (complete):** MongoDB persistence with debounced writes; rooms survive server restarts and free-tier sleep cycles.
 - ✅ **Phase 4 (complete):** Presence indicators — required name prompt on the landing page, live "in this room" list, and deterministic per-user avatar colors.
-- 🔜 **Phase 5 (planned):** Password-protected rooms, conflict-free editing (Yjs CRDT), and code execution sandbox.
+- ✅ **Phase 5 (complete):** Password-protected rooms — optional bcrypt-hashed password at creation, REST endpoints for explicit room lifecycle, client probes before connecting.
+- 🔜 **Phase 6 (planned):** Live cursor positions, conflict-free editing (Yjs CRDT), and a code execution sandbox.
+
 
 
 ## License
