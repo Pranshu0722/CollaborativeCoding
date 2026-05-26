@@ -52,14 +52,20 @@ function Room() {
       socket.emit('join-room', { roomId, name })
     })
 
-    socket.on('init-code', (initialCode) => {
-      applyingRemote.current = true
-      setCode(initialCode)
+        socket.on('init-code', (initialCode) => {
+      setCode((current) => {
+        if (current === initialCode) return current
+        applyingRemote.current = true
+        return initialCode
+      })
     })
 
     socket.on('code-change', (newCode) => {
-      applyingRemote.current = true
-      setCode(newCode)
+      setCode((current) => {
+        if (current === newCode) return current
+        applyingRemote.current = true
+        return newCode
+      })
     })
 
     socket.on('room-users', (list) => {
