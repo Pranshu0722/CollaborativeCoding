@@ -8,7 +8,7 @@ A real-time, web-based collaborative code editor. Multiple users join a room and
 
 **Frontend:** React (Vite) · Tailwind CSS · Monaco Editor · Socket.IO Client
 **Backend:** Node.js · Express.js · Socket.IO
-**Database:** MongoDB *(planned)*
+**Database:** MongoDB Atlas
 **Hosting:** Vercel (frontend) · Render (backend)
 
 ## Architecture
@@ -18,10 +18,11 @@ Browser ──HTTPS──► Vercel (static React bundle)
    │
    └── WSS ──────► Render (Node + Express + Socket.IO)
                       │
-                      └── In-memory room state: Map<roomId, latestCode>
+                      └── MongoDB Atlas: Room { roomId, code, timestamps }
+
 ```
 
-The backend keeps a per-room snapshot of the latest code so late joiners sync to current state. Real-time edits are broadcast to all sockets in the room (excluding the sender) over WebSocket. Empty rooms are garbage-collected when the last member disconnects.
+Room state is persisted to MongoDB Atlas, so a room's code survives server restarts and free-tier sleep cycles. Real-time edits are broadcast to all sockets in the room (excluding the sender) over WebSocket; DB writes are debounced at 1 write per second per room to avoid hammering the cluster on every keystroke. Late joiners get the current code via a `findOne` lookup on `join-room`.
 
 ## Repository Layout
 
@@ -36,7 +37,7 @@ The backend keeps a per-room snapshot of the latest code so late joiners sync to
 
 ## Local Development
 
-> Requires Node.js 20+ and npm.
+> Requires Node.js 20+, npm, and a MongoDB connection string (free Atlas cluster works fine).
 
 ```bash
 # 1. Install backend dependencies
@@ -57,7 +58,8 @@ npm run dev                # app on http://localhost:5173
 Both halves auto-deploy on push to `main`:
 
 - **Frontend → Vercel** — configured via `client/vercel.json`. Set `VITE_SERVER_URL` in the Vercel dashboard to point at the production backend.
-- **Backend → Render** — configured via `render.yaml`. Set `CLIENT_URL` as a comma-separated list of allowed origins (the Vercel domain + `http://localhost:5173` for local dev against prod).
+- **Backend → Render** — configured via `render.yaml`. Set `CLIENT_URL` as a comma-separated list of allowed origins (the Vercel domain + `http://localhost:5173` for local dev against prod). Also set `MONGODB_URI` to your Atlas connection string.
+- **Database → MongoDB Atlas** — free M0 cluster. Allowlist `0.0.0.0/0` in Network Access since Render's outbound IPs are dynamic; authentication via database user/password is the primary security layer.
 
 The free tier on Render sleeps after 15 minutes of inactivity; the first request after a cold start takes ~30 seconds to wake the service.
 
@@ -65,7 +67,8 @@ The free tier on Render sleeps after 15 minutes of inactivity; the first request
 
 - ✅ **Phase 1 (complete):** Real-time code sync between connected clients via Socket.IO rooms.
 - ✅ **Phase 2 (complete):** Public deployment to Vercel + Render with multi-origin CORS, SPA routing, and infrastructure-as-code.
-- 🔜 **Phase 3 (planned):** Persistence layer (MongoDB), presence indicators, conflict-free editing (Yjs CRDT), code execution sandbox.
+- ✅ **Phase 3 (complete):** MongoDB persistence with debounced writes; rooms survive server restarts and free-tier sleep cycles.
+- 🔜 **Phase 4 (planned):** Presence indicators (who's in the room), conflict-free editing (Yjs CRDT), code execution sandbox.
 
 ## License
 
