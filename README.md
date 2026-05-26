@@ -41,3 +41,9 @@ Currently in **Phase 1**: real-time code sync between connected clients.
 ## License
 
 MIT
+
+
+## Known Issues
+
+- `npm audit` reports 2 moderate-severity transitive vulnerabilities in `dompurify` via `monaco-editor`. DOMPurify is patched upstream but `monaco-editor` has not yet bumped its pinned version. Exploits require attacker-controlled HTML/Markdown to reach DOMPurify; our app does not feed external content into Monaco's display layer, so real-world exposure is negligible. Will resolve automatically when `monaco-editor` ships an update.
+
