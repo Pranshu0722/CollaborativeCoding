@@ -5,6 +5,7 @@ import cors from 'cors'
 import { Server } from 'socket.io'
 import mongoose from 'mongoose'
 import dns from 'node:dns'
+import bcrypt from 'bcryptjs'
 import Room from './models/Room.js'
 
 // Use public DNS resolvers for MongoDB Atlas SRV lookups.
@@ -31,6 +32,21 @@ if (!MONGODB_URI) {
   process.exit(1)
 }
 
+// Permissive but bounded — alphanumeric + dash/underscore, 1–40 chars.
+// Constrains both URL paths and what we'll accept into Mongoose queries.
+const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{1,40}$/
+
+// bcrypt cost factor. 10 is the de-facto default; ~80ms per compare on
+// commodity hardware — slow enough to deter brute force, fast enough not
+// to noticeably block the event loop at our scale.
+const BCRYPT_COST = 10
+
+// Initial buffer for newly-created rooms. Matches the client's loading-state
+// placeholder character-for-character so there's no flicker when the
+// init-code event lands.
+const DEFAULT_CODE = '// Welcome to your collab room\n// Open this URL in another tab and watch the sync happen\n\nfunction hello(name) {\n  return `Hello, ${name}!`\n}\n'
+
+
 app.use(cors({ origin: ALLOWED_ORIGINS }))
 app.use(express.json())
 
@@ -40,6 +56,55 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
   })
+})
+
+// POST /api/rooms — create a room, optionally password-protected.
+// Password is hashed with bcrypt before storage; plaintext is never logged.
+app.post('/api/rooms', async (req, res) => {
+  const { roomId, password } = req.body || {}
+
+  if (!roomId || typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
+    return res.status(400).json({ error: 'invalid-room-id' })
+  }
+
+  try {
+    const existing = await Room.findOne({ roomId })
+    if (existing) {
+      return res.status(409).json({ error: 'room-already-exists' })
+    }
+
+    let passwordHash = null
+    if (typeof password === 'string' && password.length > 0) {
+      passwordHash = await bcrypt.hash(password, BCRYPT_COST)
+    }
+
+      await Room.create({ roomId, code: DEFAULT_CODE, passwordHash })
+    res.status(201).json({ roomId, requiresPassword: Boolean(passwordHash) })
+  } catch (err) {
+    console.error(`  ✗ Failed to create room "${roomId}":`, err.message)
+    res.status(500).json({ error: 'internal-error' })
+  }
+})
+
+// GET /api/rooms/:roomId — public probe used by the client before connecting.
+// Reveals existence and whether a password is required, NEVER the hash itself.
+app.get('/api/rooms/:roomId', async (req, res) => {
+  const { roomId } = req.params
+
+  if (!ROOM_ID_PATTERN.test(roomId)) {
+    return res.status(400).json({ error: 'invalid-room-id' })
+  }
+
+  try {
+    const room = await Room.findOne({ roomId }).select('passwordHash')
+    if (!room) {
+      return res.json({ exists: false, requiresPassword: false })
+    }
+    res.json({ exists: true, requiresPassword: Boolean(room.passwordHash) })
+  } catch (err) {
+    console.error(`  ✗ Failed to check room "${roomId}":`, err.message)
+    res.status(500).json({ error: 'internal-error' })
+  }
 })
 
 const io = new Server(httpServer, {
@@ -98,30 +163,55 @@ async function flushRoom(roomId) {
 io.on('connection', (socket) => {
   console.log(`✓ Client connected:    ${socket.id}`)
 
-   socket.on('join-room', async ({ roomId, name } = {}) => {
-    if (!roomId || typeof roomId !== 'string') return
+     socket.on('join-room', async ({ roomId, name, password } = {}) => {
+    if (!roomId || typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
+      socket.emit('join-error', { reason: 'invalid-room-id' })
+      return
+    }
     const userName = String(name || '').trim().slice(0, 40) || 'Anonymous'
-
-    socket.join(roomId)
-    console.log(`  → ${socket.id} joined room "${roomId}" as "${userName}"`)
-
-    if (!presence.has(roomId)) presence.set(roomId, new Map())
-    presence.get(roomId).set(socket.id, { name: userName })
-    broadcastUsers(roomId)
 
     try {
       const room = await Room.findOne({ roomId })
-      if (room) socket.emit('init-code', room.code)
+      if (!room) {
+        socket.emit('join-error', { reason: 'not-found' })
+        return
+      }
+
+      if (room.passwordHash) {
+        if (typeof password !== 'string' || password.length === 0) {
+          socket.emit('join-error', { reason: 'password-required' })
+          return
+        }
+        const ok = await bcrypt.compare(password, room.passwordHash)
+        if (!ok) {
+          socket.emit('join-error', { reason: 'wrong-password' })
+          return
+        }
+      }
+
+      socket.join(roomId)
+      console.log(`  → ${socket.id} joined room "${roomId}" as "${userName}"`)
+
+      if (!presence.has(roomId)) presence.set(roomId, new Map())
+      presence.get(roomId).set(socket.id, { name: userName })
+      broadcastUsers(roomId)
+
+      socket.emit('init-code', room.code)
     } catch (err) {
-      console.error(`  ✗ Failed to load room "${roomId}":`, err.message)
+      console.error(`  ✗ Failed to join room "${roomId}":`, err.message)
+      socket.emit('join-error', { reason: 'internal-error' })
     }
   })
 
-    socket.on('code-change', ({ roomId, code }) => {
+      socket.on('code-change', ({ roomId, code }) => {
+    // Defend against ghost emits — if join-room rejected this socket,
+    // it never entered socket.rooms and shouldn't be able to mutate the doc.
+    if (!socket.rooms.has(roomId)) return
     // Broadcast first for low latency — peers don't wait for the DB write.
     socket.to(roomId).emit('code-change', code)
     schedulePersist(roomId, code)
   })
+
 
 
     socket.on('disconnecting', () => {
