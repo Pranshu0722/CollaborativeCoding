@@ -51,6 +51,22 @@ const io = new Server(httpServer, {
 const FLUSH_INTERVAL_MS = 1000
 const pendingWrites = new Map() // roomId -> { code, timer }
 
+// Presence: roomId -> Map<socketId, { name }>. Ephemeral; never persisted.
+// Lives only as long as sockets are connected.
+const presence = new Map()
+
+function getRoomUsers(roomId) {
+  const roomPresence = presence.get(roomId)
+  if (!roomPresence) return []
+  return Array.from(roomPresence.entries())
+    .map(([socketId, user]) => ({ socketId, name: user.name }))
+    .sort((a, b) => a.socketId.localeCompare(b.socketId))
+}
+
+function broadcastUsers(roomId) {
+  io.to(roomId).emit('room-users', getRoomUsers(roomId))
+}
+
 function schedulePersist(roomId, code) {
   const existing = pendingWrites.get(roomId)
   if (existing) {
@@ -82,15 +98,20 @@ async function flushRoom(roomId) {
 io.on('connection', (socket) => {
   console.log(`✓ Client connected:    ${socket.id}`)
 
-  socket.on('join-room', async (roomId) => {
+   socket.on('join-room', async ({ roomId, name } = {}) => {
+    if (!roomId || typeof roomId !== 'string') return
+    const userName = String(name || '').trim().slice(0, 40) || 'Anonymous'
+
     socket.join(roomId)
-    console.log(`  → ${socket.id} joined room "${roomId}"`)
+    console.log(`  → ${socket.id} joined room "${roomId}" as "${userName}"`)
+
+    if (!presence.has(roomId)) presence.set(roomId, new Map())
+    presence.get(roomId).set(socket.id, { name: userName })
+    broadcastUsers(roomId)
 
     try {
       const room = await Room.findOne({ roomId })
-      if (room) {
-        socket.emit('init-code', room.code)
-      }
+      if (room) socket.emit('init-code', room.code)
     } catch (err) {
       console.error(`  ✗ Failed to load room "${roomId}":`, err.message)
     }
@@ -103,8 +124,18 @@ io.on('connection', (socket) => {
   })
 
 
-  socket.on('disconnect', (reason) => {
-    console.log(`✗ Client disconnected: ${socket.id} (${reason})`)
+    socket.on('disconnecting', () => {
+    for (const roomId of socket.rooms) {
+      if (roomId === socket.id) continue
+      const roomPresence = presence.get(roomId)
+      if (!roomPresence) continue
+      roomPresence.delete(socket.id)
+      if (roomPresence.size === 0) {
+        presence.delete(roomId)
+      } else {
+        broadcastUsers(roomId)
+      }
+    }
   })
 })
 
