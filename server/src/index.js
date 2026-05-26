@@ -41,6 +41,11 @@ const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{1,40}$/
 // to noticeably block the event loop at our scale.
 const BCRYPT_COST = 10
 
+// Initial buffer for newly-created rooms. Matches the client's loading-state
+// placeholder character-for-character so there's no flicker when the
+// init-code event lands.
+const DEFAULT_CODE = '// Welcome to your collab room\n// Open this URL in another tab and watch the sync happen\n\nfunction hello(name) {\n  return `Hello, ${name}!`\n}\n'
+
 
 app.use(cors({ origin: ALLOWED_ORIGINS }))
 app.use(express.json())
@@ -73,7 +78,7 @@ app.post('/api/rooms', async (req, res) => {
       passwordHash = await bcrypt.hash(password, BCRYPT_COST)
     }
 
-    await Room.create({ roomId, code: '', passwordHash })
+      await Room.create({ roomId, code: DEFAULT_CODE, passwordHash })
     res.status(201).json({ roomId, requiresPassword: Boolean(passwordHash) })
   } catch (err) {
     console.error(`  ✗ Failed to create room "${roomId}":`, err.message)
