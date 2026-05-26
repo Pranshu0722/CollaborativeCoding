@@ -8,9 +8,15 @@ const app = express()
 const httpServer = http.createServer(app)
 
 const PORT = process.env.PORT || 5000
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173'
 
-app.use(cors({ origin: CLIENT_URL }))
+// CLIENT_URL accepts a comma-separated list so we can allow dev + production
+// origins simultaneously (e.g. "http://localhost:5173,https://app.vercel.app").
+const ALLOWED_ORIGINS = (process.env.CLIENT_URL || 'http://localhost:5173')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+app.use(cors({ origin: ALLOWED_ORIGINS }))
 app.use(express.json())
 
 app.get('/health', (req, res) => {
@@ -22,7 +28,7 @@ app.get('/health', (req, res) => {
 })
 
 const io = new Server(httpServer, {
-  cors: { origin: CLIENT_URL },
+  cors: { origin: ALLOWED_ORIGINS },
 })
 
 // In-memory store: latest code per room (roomId -> string).
@@ -75,5 +81,6 @@ io.on('connection', (socket) => {
 
 httpServer.listen(PORT, () => {
   console.log(`✓ Server listening on http://localhost:${PORT}`)
-  console.log(`  CORS allowed origin: ${CLIENT_URL}`)
+  console.log(`  CORS allowed origins: ${ALLOWED_ORIGINS.join(', ')}`)
 })
+
