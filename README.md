@@ -28,6 +28,8 @@ Active users (presence) are tracked in-memory per room and broadcast to all sock
 
 Rooms are created explicitly via `POST /api/rooms` with an optional password, which is bcrypt-hashed (cost factor 10) before storage — plaintext is never written or logged. Before opening a socket, the client probes `GET /api/rooms/:id` to learn whether the room exists and whether it needs a password; private rooms show an inline prompt, with the entered password cached in `sessionStorage` (tab-scoped) so the creator's immediate navigate and any in-tab reloads connect without re-prompting. Existing rooms from before this change remain public — `passwordHash` defaults to `null`.
 
+Live cursor positions are broadcast over a separate `cursor-move` socket event, throttled client-side to ~20 events per second to keep traffic bounded. Each remote caret renders as a thin colored line at the peer's exact line/column in the editor, in the same color as their avatar chip — derived from the same socket-ID hash, so cursor and chip always match without any server coordination. Cursor positions are never persisted, and prune automatically when a peer leaves.
+
 ## Repository Layout
 
 ```
@@ -74,9 +76,9 @@ The free tier on Render sleeps after 15 minutes of inactivity; the first request
 - ✅ **Phase 3 (complete):** MongoDB persistence with debounced writes; rooms survive server restarts and free-tier sleep cycles.
 - ✅ **Phase 4 (complete):** Presence indicators — required name prompt on the landing page, live "in this room" list, and deterministic per-user avatar colors.
 - ✅ **Phase 5 (complete):** Password-protected rooms — optional bcrypt-hashed password at creation, REST endpoints for explicit room lifecycle, client probes before connecting.
-- 🔜 **Phase 6 (planned):** Live cursor positions, conflict-free editing (Yjs CRDT), and a code execution sandbox.
-
-
+- ✅ **Phase 6 (complete):** Live cursor positions — each peer's caret renders in their avatar color, throttled to ~20 events per second, ephemeral (never persisted), prunes automatically on disconnect.
+- 🚧 **Phase 7 (planned):** Code execution sandbox.
+- 🚧 **Future:** Conflict-free editing (Yjs CRDT).
 
 ## License
 
