@@ -203,7 +203,7 @@ io.on('connection', (socket) => {
     }
   })
 
-      socket.on('code-change', ({ roomId, code }) => {
+  socket.on('code-change', ({ roomId, code }) => {
     // Defend against ghost emits — if join-room rejected this socket,
     // it never entered socket.rooms and shouldn't be able to mutate the doc.
     if (!socket.rooms.has(roomId)) return
@@ -212,7 +212,30 @@ io.on('connection', (socket) => {
     schedulePersist(roomId, code)
   })
 
-
+  socket.on('cursor-move', ({ roomId, position } = {}) => {
+    // Same admission guard as code-change.
+    if (!roomId || !socket.rooms.has(roomId)) return
+    if (
+      !position ||
+      typeof position.lineNumber !== 'number' ||
+      typeof position.column !== 'number' ||
+      !Number.isFinite(position.lineNumber) ||
+      !Number.isFinite(position.column) ||
+      position.lineNumber < 1 ||
+      position.column < 1
+    ) {
+      return
+    }
+    // Relay to other peers in the room. Never echo back to sender,
+    // never persist — cursors are ephemeral.
+    socket.to(roomId).emit('cursor-move', {
+      socketId: socket.id,
+      position: {
+        lineNumber: position.lineNumber,
+        column: position.column,
+      },
+    })
+  })
 
     socket.on('disconnecting', () => {
     for (const roomId of socket.rooms) {

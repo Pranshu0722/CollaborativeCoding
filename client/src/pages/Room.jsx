@@ -21,18 +21,65 @@ const AVATAR_COLORS = [
   'bg-rose-400',
 ]
 
-function colorForSocket(socketId) {
+function colorIndexForSocket(socketId) {
   let hash = 0
   for (let i = 0; i < socketId.length; i++) {
     hash = (hash * 31 + socketId.charCodeAt(i)) >>> 0
   }
-  return AVATAR_COLORS[hash % AVATAR_COLORS.length]
+  return hash % AVATAR_COLORS.length
 }
+
+function colorForSocket(socketId) {
+  return AVATAR_COLORS[colorIndexForSocket(socketId)]
+}
+
+
+// Leading + trailing throttle. First call emits immediately; subsequent calls
+// within `intervalMs` coalesce into a single trailing emit. Keeps cursor
+// traffic to ~20 ev/s per user even when arrow-keying through a file.
+function createCursorThrottle(emit, intervalMs = 50) {
+  let lastEmitAt = 0
+  let pendingPosition = null
+  let timer = null
+
+  function flush() {
+    timer = null
+    if (pendingPosition !== null) {
+      lastEmitAt = Date.now()
+      emit(pendingPosition)
+      pendingPosition = null
+    }
+  }
+
+  return (position) => {
+    const now = Date.now()
+    const elapsed = now - lastEmitAt
+    if (elapsed >= intervalMs) {
+      lastEmitAt = now
+      emit(position)
+    } else {
+      pendingPosition = position
+      if (!timer) timer = setTimeout(flush, intervalMs - elapsed)
+    }
+  }
+}
+
 
 function Room() {
   const { roomId } = useParams()
   const socketRef = useRef(null)
+  const editorRef = useRef(null)
   const applyingRemote = useRef(false)
+  // socketId -> { lineNumber, column }. Imperative state — we don't want
+  // React re-rendering on every remote keystroke; Monaco's decoration API
+  // handles the DOM directly.
+  const remoteCursorsRef = useRef(new Map())
+  // Monaco's decorations collection. Created once on editor mount, then
+  // .set([...]) replaces the visible set atomically on each update.
+  const decorationsRef = useRef(null)
+  // The monaco namespace itself — captured from onMount because
+  // @monaco-editor/react doesn't expose it globally.
+  const monacoRef = useRef(null)
   // Password we'll submit on the next connection attempt. Held in a ref
   // so that mutating it doesn't itself trigger a re-render / reconnect.
   const passwordRef = useRef(null)
@@ -141,7 +188,18 @@ function Room() {
 
     socket.on('room-users', (list) => {
       setUsers(list)
+      // Prune cursors for users no longer in the room.
+      const presentIds = new Set(list.map((u) => u.socketId))
+      let changed = false
+      for (const id of remoteCursorsRef.current.keys()) {
+        if (!presentIds.has(id)) {
+          remoteCursorsRef.current.delete(id)
+          changed = true
+        }
+      }
+      if (changed) renderCursors()
     })
+
 
     socket.on('join-error', ({ reason }) => {
       // Server rejected our join. Tear down the socket and route the user
@@ -164,10 +222,17 @@ function Room() {
       }
     })
 
+    socket.on('cursor-move', ({ socketId: remoteId, position }) => {
+      remoteCursorsRef.current.set(remoteId, position)
+      renderCursors()
+    })
+
     socket.on('disconnect', () => {
       setConnected(false)
       setSocketId(null)
       setUsers([])
+      remoteCursorsRef.current.clear()
+      renderCursors()
     })
 
     return () => {
@@ -175,6 +240,33 @@ function Room() {
       socketRef.current = null
     }
   }, [connectKey, roomId])
+
+  const renderCursors = () => {
+    const editor = editorRef.current
+    const collection = decorationsRef.current
+    const monaco = monacoRef.current
+    if (!editor || !collection || !monaco) return
+
+    const decorations = []
+
+    for (const [remoteId, pos] of remoteCursorsRef.current.entries()) {
+      const colorIndex = colorIndexForSocket(remoteId)
+      decorations.push({
+        range: new monaco.Range(
+          pos.lineNumber,
+          pos.column,
+          pos.lineNumber,
+          pos.column
+        ),
+        options: {
+          beforeContentClassName: `remote-cursor remote-cursor-${colorIndex}`,
+          stickiness:
+            monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+        },
+      })
+    }
+    collection.set(decorations)
+  }
 
   const handleChange = (value) => {
     const newCode = value ?? ''
@@ -361,6 +453,27 @@ function Room() {
           theme="vs-dark"
           value={code}
           onChange={handleChange}
+          onMount={(editor, monaco) => {
+            editorRef.current = editor
+            monacoRef.current = monaco
+            decorationsRef.current = editor.createDecorationsCollection([])
+
+            const emitCursor = createCursorThrottle((position) => {
+              socketRef.current?.emit('cursor-move', { roomId, position })
+            }, 50)
+
+            editor.onDidChangeCursorPosition((e) => {
+              emitCursor({
+                lineNumber: e.position.lineNumber,
+                column: e.position.column,
+              })
+            })
+
+            // If cursor events arrived before the editor finished mounting,
+            // render them now.
+            renderCursors()
+          }}
+
           options={{
             fontSize: 14,
             minimap: { enabled: false },
