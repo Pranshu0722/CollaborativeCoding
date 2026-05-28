@@ -41,11 +41,89 @@ const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{1,40}$/
 // to noticeably block the event loop at our scale.
 const BCRYPT_COST = 10
 
-// Initial buffer for newly-created rooms. Matches the client's loading-state
-// placeholder character-for-character so there's no flicker when the
-// init-code event lands.
-const DEFAULT_CODE = '// Welcome to your collab room\n// Open this URL in another tab and watch the sync happen\n\nfunction hello(name) {\n  return `Hello, ${name}!`\n}\n'
+// Languages we accept for new rooms, language-change events, and execute.
+// Keys are Monaco language IDs; PISTON_LANGUAGE maps them to whatever
+// names the Piston API expects (only "cpp" → "c++" actually differs).
+const SUPPORTED_LANGUAGES = ['javascript', 'python', 'cpp', 'java', 'go', 'rust']
 
+const PISTON_LANGUAGE = {
+  javascript: 'javascript',
+  python: 'python',
+  cpp: 'c++',
+  java: 'java',
+  go: 'go',
+  rust: 'rust',
+}
+
+// Initial buffer for newly-created rooms, one per supported language.
+// Each snippet defines and calls a small function so a fresh room produces
+// visible output when the user hits Run.
+const DEFAULT_CODE_BY_LANGUAGE = {
+  javascript: `// Welcome to your collab room
+// Hit Run to execute, or share the URL to code together
+function hello(name) {
+  return \`Hello, \${name}!\`
+}
+console.log(hello("world"))
+`,
+  python: `# Welcome to your collab room
+# Hit Run to execute, or share the URL to code together
+def hello(name):
+    return f"Hello, {name}!"
+
+print(hello("world"))
+`,
+  cpp: `// Welcome to your collab room
+// Hit Run to execute, or share the URL to code together
+#include <iostream>
+#include <string>
+
+std::string hello(const std::string& name) {
+  return "Hello, " + name + "!";
+}
+
+int main() {
+  std::cout << hello("world") << std::endl;
+  return 0;
+}
+`,
+  java: `// Welcome to your collab room
+// Hit Run to execute, or share the URL to code together
+public class Main {
+  static String hello(String name) {
+    return "Hello, " + name + "!";
+  }
+
+  public static void main(String[] args) {
+    System.out.println(hello("world"));
+  }
+}
+`,
+  go: `// Welcome to your collab room
+// Hit Run to execute, or share the URL to code together
+package main
+
+import "fmt"
+
+func hello(name string) string {
+  return "Hello, " + name + "!"
+}
+
+func main() {
+  fmt.Println(hello("world"))
+}
+`,
+  rust: `// Welcome to your collab room
+// Hit Run to execute, or share the URL to code together
+fn hello(name: &str) -> String {
+  format!("Hello, {}!", name)
+}
+
+fn main() {
+  println!("{}", hello("world"));
+}
+`,
+}
 
 app.use(cors({ origin: ALLOWED_ORIGINS }))
 app.use(express.json())
@@ -77,8 +155,14 @@ app.post('/api/rooms', async (req, res) => {
     if (typeof password === 'string' && password.length > 0) {
       passwordHash = await bcrypt.hash(password, BCRYPT_COST)
     }
-
-      await Room.create({ roomId, code: DEFAULT_CODE, passwordHash })
+    await Room.create({
+      roomId,
+      codeByLanguage: new Map([
+        ['javascript', DEFAULT_CODE_BY_LANGUAGE.javascript],
+      ]),
+      language: 'javascript',
+      passwordHash,
+    })
     res.status(201).json({ roomId, requiresPassword: Boolean(passwordHash) })
   } catch (err) {
     console.error(`  ✗ Failed to create room "${roomId}":`, err.message)
@@ -111,10 +195,14 @@ const io = new Server(httpServer, {
   cors: { origin: ALLOWED_ORIGINS },
 })
 
-// Coalesce DB writes: per-room, write at most once per FLUSH_INTERVAL_MS.
-// Keystrokes update the in-memory buffer; the timer flushes the latest code.
+// Coalesce DB writes per (roomId, language). Keystrokes mutate the in-memory
+// buffer; a single timer per (roomId, language) flushes the latest code.
 const FLUSH_INTERVAL_MS = 1000
-const pendingWrites = new Map() // roomId -> { code, timer }
+const pendingWrites = new Map() // key -> { code, timer }
+
+function pendingKey(roomId, language) {
+  return `${roomId}::${language}`
+}
 
 // Presence: roomId -> Map<socketId, { name }>. Ephemeral; never persisted.
 // Lives only as long as sockets are connected.
@@ -132,38 +220,64 @@ function broadcastUsers(roomId) {
   io.to(roomId).emit('room-users', getRoomUsers(roomId))
 }
 
-function schedulePersist(roomId, code) {
-  const existing = pendingWrites.get(roomId)
+function schedulePersist(roomId, language, code) {
+  const key = pendingKey(roomId, language)
+  const existing = pendingWrites.get(key)
   if (existing) {
-    // A flush is already scheduled; just update the buffered code.
     existing.code = code
     return
   }
-
-  const timer = setTimeout(() => flushRoom(roomId), FLUSH_INTERVAL_MS)
-  pendingWrites.set(roomId, { code, timer })
+  const timer = setTimeout(() => flushWrite(roomId, language), FLUSH_INTERVAL_MS)
+  pendingWrites.set(key, { code, timer })
 }
 
-async function flushRoom(roomId) {
-  const pending = pendingWrites.get(roomId)
+async function flushWrite(roomId, language) {
+  const key = pendingKey(roomId, language)
+  const pending = pendingWrites.get(key)
   if (!pending) return
-  pendingWrites.delete(roomId)
+  pendingWrites.delete(key)
 
   try {
     await Room.findOneAndUpdate(
       { roomId },
-      { code: pending.code },
-      { upsert: true }
+      { $set: { [`codeByLanguage.${language}`]: pending.code } }
     )
   } catch (err) {
-    console.error(`  ✗ Failed to persist room "${roomId}":`, err.message)
+    console.error(
+      `  ✗ Failed to persist ${language} code for "${roomId}":`,
+      err.message
+    )
   }
+}
+
+// Load a room, migrating pre-7.2.5 docs in place: if codeByLanguage is empty
+// but the legacy `code` field has content, seed codeByLanguage[language] from
+// it and clear the legacy field. Idempotent — already-migrated rooms are a no-op.
+async function loadRoom(roomId) {
+  const room = await Room.findOne({ roomId })
+  if (!room) return null
+
+  const hasNewData = room.codeByLanguage && room.codeByLanguage.size > 0
+  if (!hasNewData && typeof room.code === 'string' && room.code.length > 0) {
+    room.codeByLanguage = new Map([[room.language, room.code]])
+    room.code = undefined
+    await room.save()
+  }
+  return room
+}
+
+function getRoomCode(room, language) {
+  return (
+    room.codeByLanguage?.get(language) ??
+    DEFAULT_CODE_BY_LANGUAGE[language] ??
+    ''
+  )
 }
 
 io.on('connection', (socket) => {
   console.log(`✓ Client connected:    ${socket.id}`)
 
-     socket.on('join-room', async ({ roomId, name, password } = {}) => {
+  socket.on('join-room', async ({ roomId, name, password } = {}) => {
     if (!roomId || typeof roomId !== 'string' || !ROOM_ID_PATTERN.test(roomId)) {
       socket.emit('join-error', { reason: 'invalid-room-id' })
       return
@@ -171,7 +285,7 @@ io.on('connection', (socket) => {
     const userName = String(name || '').trim().slice(0, 40) || 'Anonymous'
 
     try {
-      const room = await Room.findOne({ roomId })
+      const room = await loadRoom(roomId)
       if (!room) {
         socket.emit('join-error', { reason: 'not-found' })
         return
@@ -196,24 +310,50 @@ io.on('connection', (socket) => {
       presence.get(roomId).set(socket.id, { name: userName })
       broadcastUsers(roomId)
 
-      socket.emit('init-code', room.code)
+      socket.emit('init-room', {
+        code: getRoomCode(room, room.language),
+        language: room.language,
+      })
     } catch (err) {
       console.error(`  ✗ Failed to join room "${roomId}":`, err.message)
       socket.emit('join-error', { reason: 'internal-error' })
     }
   })
 
-  socket.on('code-change', ({ roomId, code }) => {
-    // Defend against ghost emits — if join-room rejected this socket,
-    // it never entered socket.rooms and shouldn't be able to mutate the doc.
-    if (!socket.rooms.has(roomId)) return
-    // Broadcast first for low latency — peers don't wait for the DB write.
-    socket.to(roomId).emit('code-change', code)
-    schedulePersist(roomId, code)
+  socket.on('code-change', ({ roomId, code, language } = {}) => {
+    if (!roomId || !socket.rooms.has(roomId)) return
+    if (typeof code !== 'string') return
+    if (!SUPPORTED_LANGUAGES.includes(language)) return
+
+    // Broadcast first for low latency. Include the language so peers can
+    // filter out edits authored under a now-stale language (race condition
+    // when someone switches language mid-typing).
+    socket.to(roomId).emit('code-change', { code, language })
+    schedulePersist(roomId, language, code)
+  })
+
+  socket.on('language-change', async ({ roomId, language } = {}) => {
+    if (!roomId || !socket.rooms.has(roomId)) return
+    if (!SUPPORTED_LANGUAGES.includes(language)) return
+
+    try {
+      const room = await loadRoom(roomId)
+      if (!room) return
+      if (room.language === language) return // no-op
+
+      room.language = language
+      await room.save()
+
+      io.to(roomId).emit('language-change', {
+        language,
+        code: getRoomCode(room, language),
+      })
+    } catch (err) {
+      console.error(`  ✗ language-change failed for "${roomId}":`, err.message)
+    }
   })
 
   socket.on('cursor-move', ({ roomId, position } = {}) => {
-    // Same admission guard as code-change.
     if (!roomId || !socket.rooms.has(roomId)) return
     if (
       !position ||
@@ -226,8 +366,7 @@ io.on('connection', (socket) => {
     ) {
       return
     }
-    // Relay to other peers in the room. Never echo back to sender,
-    // never persist — cursors are ephemeral.
+
     socket.to(roomId).emit('cursor-move', {
       socketId: socket.id,
       position: {
@@ -237,7 +376,7 @@ io.on('connection', (socket) => {
     })
   })
 
-    socket.on('disconnecting', () => {
+  socket.on('disconnecting', () => {
     for (const roomId of socket.rooms) {
       if (roomId === socket.id) continue
       const roomPresence = presence.get(roomId)
