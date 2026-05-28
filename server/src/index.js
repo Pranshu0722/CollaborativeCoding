@@ -32,6 +32,14 @@ if (!MONGODB_URI) {
   process.exit(1)
 }
 
+const JDOODLE_CLIENT_ID = process.env.JDOODLE_CLIENT_ID
+const JDOODLE_CLIENT_SECRET = process.env.JDOODLE_CLIENT_SECRET
+if (!JDOODLE_CLIENT_ID || !JDOODLE_CLIENT_SECRET) {
+  console.error('✗ JDOODLE_CLIENT_ID / JDOODLE_CLIENT_SECRET not set. Refusing to start.')
+  process.exit(1)
+}
+
+
 // Permissive but bounded — alphanumeric + dash/underscore, 1–40 chars.
 // Constrains both URL paths and what we'll accept into Mongoose queries.
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{1,40}$/
@@ -46,14 +54,20 @@ const BCRYPT_COST = 10
 // names the Piston API expects (only "cpp" → "c++" actually differs).
 const SUPPORTED_LANGUAGES = ['javascript', 'python', 'cpp', 'java', 'go', 'rust']
 
-const PISTON_LANGUAGE = {
-  javascript: 'javascript',
-  python: 'python',
-  cpp: 'c++',
-  java: 'java',
-  go: 'go',
-  rust: 'rust',
+// JDoodle language map. versionIndex on JDoodle is positional — '0' is the
+// OLDEST installed version, higher numbers are newer. We pick '4' across the
+// board because it's a "modern but safe" index that's been stable for years
+// on the public API. If JDoodle ever returns "versionIndex out of range",
+// drop the offending language back to '3' or '2'.
+const JDOODLE_RUNTIME = {
+  javascript: { language: 'nodejs',  versionIndex: '4' },  // Node 18.x
+  python:     { language: 'python3', versionIndex: '4' },  // Python 3.9+ (f-strings)
+  cpp:        { language: 'cpp17',   versionIndex: '0' },  // cpp17 only has 1-2 versions
+  java:       { language: 'java',    versionIndex: '4' },  // Java 17
+  go:         { language: 'go',      versionIndex: '3' },  // Go has fewer versions
+  rust:       { language: 'rust',    versionIndex: '0' },  // Rust typically just 1 version
 }
+
 
 // Initial buffer for newly-created rooms, one per supported language.
 // Each snippet defines and calls a small function so a fresh room produces
@@ -191,6 +205,107 @@ app.get('/api/rooms/:roomId', async (req, res) => {
   }
 })
 
+// POST /api/execute — run code via Piston and broadcast the result to the room.
+// Auth: caller's socket must currently be a member of the room they claim.
+app.post('/api/execute', async (req, res) => {
+  const { roomId, language, code, stdin, socketId } = req.body || {}
+
+  if (!roomId || !ROOM_ID_PATTERN.test(roomId)) {
+    return res.status(400).json({ error: 'invalid-room-id' })
+  }
+  if (!SUPPORTED_LANGUAGES.includes(language)) {
+    return res.status(400).json({ error: 'invalid-language' })
+  }
+  if (typeof code !== 'string') {
+    return res.status(400).json({ error: 'invalid-code' })
+  }
+  if (code.length > 64 * 1024) {
+    return res.status(413).json({ error: 'code-too-large' })
+  }
+  if (stdin !== undefined && typeof stdin !== 'string') {
+    return res.status(400).json({ error: 'invalid-stdin' })
+  }
+  if (!socketId || typeof socketId !== 'string') {
+    return res.status(400).json({ error: 'invalid-socket-id' })
+  }
+
+  // Auth: caller's socket must currently be in the room. Socket.IO maintains
+  // a Set<socketId> per room name in its adapter.
+  const roomSockets = io.sockets.adapter.rooms.get(roomId)
+  if (!roomSockets || !roomSockets.has(socketId)) {
+    return res.status(403).json({ error: 'not-in-room' })
+  }
+
+  // Per-room cooldown.
+  const now = Date.now()
+  const last = lastRunAt.get(roomId) || 0
+  if (now - last < RUN_COOLDOWN_MS) {
+    return res.status(429).json({
+      error: 'rate-limited',
+      waitMs: RUN_COOLDOWN_MS - (now - last),
+    })
+  }
+  lastRunAt.set(roomId, now)
+
+  const runnerName = presence.get(roomId)?.get(socketId)?.name || 'Anonymous'
+  const startedAt = Date.now()
+
+  try {
+    const runtime = JDOODLE_RUNTIME[language]
+    const jdoodleRes = await fetch('https://api.jdoodle.com/v1/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientId: JDOODLE_CLIENT_ID,
+        clientSecret: JDOODLE_CLIENT_SECRET,
+        script: code,
+        language: runtime.language,
+        versionIndex: runtime.versionIndex,
+        stdin: stdin || '',
+      }),
+    })
+
+    if (!jdoodleRes.ok) {
+      const body = await jdoodleRes.text().catch(() => '<no body>')
+      console.error(
+        `  ✗ JDoodle returned ${jdoodleRes.status} for room "${roomId}":`,
+        body
+      )
+      return res.status(502).json({ error: 'execute-failed' })
+    }
+
+    const data = await jdoodleRes.json()
+
+    // JDoodle returns 200 even on auth errors / daily-limit / unsupported
+    // language — surfaces the real failure in an `error` field instead of HTTP.
+    if (data.error) {
+      console.error(`  ✗ JDoodle error for room "${roomId}":`, data.error)
+      // Daily limit gets its own status so the client can show a clear message.
+      if (/limit|credit/i.test(data.error)) {
+        return res.status(429).json({ error: 'daily-limit-reached' })
+      }
+      return res.status(502).json({ error: 'execute-failed' })
+    }
+
+    // JDoodle merges stdout and stderr into a single `output` field — no way
+    // to separate. Stuff everything into stdout; stderr stays empty.
+    const result = {
+      language,
+      stdout: data.output || '',
+      stderr: '',
+      exitCode: typeof data.statusCode === 'number' && data.statusCode !== 200 ? 1 : 0,
+      executionTimeMs: Date.now() - startedAt,
+      runBy: { socketId, name: runnerName },
+    }
+
+    io.to(roomId).except(socketId).emit('execution-result', result)
+    return res.json(result)
+  } catch (err) {
+    console.error(`  ✗ Execute failed for "${roomId}":`, err.message)
+    return res.status(502).json({ error: 'execute-failed' })
+  }
+})
+
 const io = new Server(httpServer, {
   cors: { origin: ALLOWED_ORIGINS },
 })
@@ -199,6 +314,12 @@ const io = new Server(httpServer, {
 // buffer; a single timer per (roomId, language) flushes the latest code.
 const FLUSH_INTERVAL_MS = 1000
 const pendingWrites = new Map() // key -> { code, timer }
+
+// Per-room execute cooldown. Cheap defense in depth against runaway loops
+// or someone hammering the Run button; Piston's public tier has its own
+// rate limit too.
+const RUN_COOLDOWN_MS = 2000
+const lastRunAt = new Map() // roomId -> timestamp
 
 function pendingKey(roomId, language) {
   return `${roomId}::${language}`
