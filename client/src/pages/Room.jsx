@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { io } from 'socket.io-client'
 import Editor from '@monaco-editor/react'
@@ -20,6 +20,16 @@ const AVATAR_COLORS = [
   'bg-orange-400',
   'bg-rose-400',
 ]
+
+const LANGUAGE_OPTIONS = [
+  { id: 'javascript', label: 'JavaScript' },
+  { id: 'python',     label: 'Python'     },
+  { id: 'cpp',        label: 'C++'        },
+  { id: 'java',       label: 'Java'       },
+  { id: 'go',         label: 'Go'         },
+  { id: 'rust',       label: 'Rust'       },
+]
+
 
 function colorIndexForSocket(socketId) {
   let hash = 0
@@ -83,6 +93,17 @@ function Room() {
   // Password we'll submit on the next connection attempt. Held in a ref
   // so that mutating it doesn't itself trigger a re-render / reconnect.
   const passwordRef = useRef(null)
+  // The socket listeners in the connection useEffect close over `language` at
+  // the time the socket was created. To filter incoming code-changes by the
+  // current language, we read through a ref that always points at the latest.
+  const languageRef = useRef('javascript')
+
+
+  // Cursor position captured right before a remote code-change lands.
+  // Restored in handleChange to undo the cursor drag Monaco does when its
+  // controlled `value` prop is updated.
+  const savedCursorPositionRef = useRef(null)
+
 
   // 'probing' | 'password-required' | 'connecting' | 'connected' | 'not-found' | 'error'
   const [status, setStatus] = useState('probing')
@@ -94,9 +115,14 @@ function Room() {
   const [connected, setConnected] = useState(false)
   const [socketId, setSocketId] = useState(null)
   const [users, setUsers] = useState([])
+  const [language, setLanguage] = useState('javascript')
   const [code, setCode] = useState(
-    '// Welcome to your collab room\n// Open this URL in another tab and watch the sync happen\n\nfunction hello(name) {\n  return `Hello, ${name}!`\n}\n'
+    '// Loading…\n'
   )
+
+  useEffect(() => {
+    languageRef.current = language
+  }, [language])
 
   // Probe the room before connecting. Determines whether to connect
   // immediately (public / cached password) or show a password prompt first.
@@ -169,8 +195,9 @@ function Room() {
       })
     })
 
-    socket.on('init-code', (initialCode) => {
+    socket.on('init-room', ({ code: initialCode, language: initialLanguage }) => {
       setStatus('connected')
+      setLanguage(initialLanguage)
       setCode((current) => {
         if (current === initialCode) return current
         applyingRemote.current = true
@@ -178,13 +205,42 @@ function Room() {
       })
     })
 
-    socket.on('code-change', (newCode) => {
+    socket.on('code-change', ({ code: newCode, language: incomingLang }) => {
+      // A peer who hasn't yet received our language-change may still be
+      // broadcasting edits authored in the old language. Ignore those.
+      if (incomingLang !== languageRef.current) return
+
+      const editor = editorRef.current
+      if (editor) {
+        savedCursorPositionRef.current = editor.getPosition()
+      }
       setCode((current) => {
         if (current === newCode) return current
         applyingRemote.current = true
         return newCode
       })
     })
+
+    socket.on('language-change', ({ language: newLang, code: newCode }) => {
+      // Capture cursor before the buffer swaps — same dance as code-change.
+      const editor = editorRef.current
+      if (editor) {
+        savedCursorPositionRef.current = editor.getPosition()
+      }
+
+      setLanguage(newLang)
+      setCode((prev) => {
+        if (prev === newCode) return prev
+        applyingRemote.current = true
+        return newCode
+      })
+
+      // Cursor positions captured under the old language's code don't make sense
+      // in the new language's buffer. Drop them; remotes will re-emit on next move.
+      remoteCursorsRef.current.clear()
+      renderCursors()
+    })
+
 
     socket.on('room-users', (list) => {
       setUsers(list)
@@ -223,6 +279,15 @@ function Room() {
     })
 
     socket.on('cursor-move', ({ socketId: remoteId, position }) => {
+      if (
+        !position ||
+        typeof position.lineNumber !== 'number' ||
+        typeof position.column !== 'number' ||
+        position.lineNumber < 1 ||
+        position.column < 1
+      ) {
+        return
+      }
       remoteCursorsRef.current.set(remoteId, position)
       renderCursors()
     })
@@ -241,7 +306,7 @@ function Room() {
     }
   }, [connectKey, roomId])
 
-  const renderCursors = () => {
+    const renderCursors = useCallback(() => {
     const editor = editorRef.current
     const collection = decorationsRef.current
     const monaco = monacoRef.current
@@ -266,19 +331,28 @@ function Room() {
       })
     }
     collection.set(decorations)
-  }
+}, [])
 
   const handleChange = (value) => {
     const newCode = value ?? ''
     setCode(newCode)
 
     if (applyingRemote.current) {
+      // Undo the cursor drag Monaco does when executeEdits replaces the model.
+      // We keep applyingRemote=true across setPosition so the cursor listener
+      // doesn't emit the shifted-then-restored intermediate position.
+      const editor = editorRef.current
+      if (editor && savedCursorPositionRef.current) {
+        editor.setPosition(savedCursorPositionRef.current)
+        savedCursorPositionRef.current = null
+      }
       applyingRemote.current = false
       return
     }
 
-    socketRef.current?.emit('code-change', { roomId, code: newCode })
+    socketRef.current?.emit('code-change', { roomId, code: newCode, language: languageRef.current })
   }
+
 
   const handlePasswordSubmit = (e) => {
     e.preventDefault()
@@ -406,16 +480,36 @@ function Room() {
             </h1>
           </div>
 
-          <div className="flex items-center gap-2 text-sm">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                connected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-              }`}
-            />
-            <span className={connected ? 'text-emerald-400' : 'text-amber-400'}>
-              {connected ? 'Connected' : 'Connecting…'}
-            </span>
+          <div className="flex items-center gap-3 text-sm">
+            <select
+              value={language}
+              onChange={(e) => {
+                socketRef.current?.emit('language-change', {
+                  roomId,
+                  language: e.target.value,
+                })
+              }}
+              disabled={status !== 'connected'}
+              className="bg-slate-800 text-slate-100 text-sm rounded px-2 py-1 border border-slate-700 focus:outline-none focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-label="Programming language"
+            >
+              {LANGUAGE_OPTIONS.map((opt) => (
+                <option key={opt.id} value={opt.id}>{opt.label}</option>
+              ))}
+            </select>
+
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  connected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                }`}
+              />
+              <span className={connected ? 'text-emerald-400' : 'text-amber-400'}>
+                {connected ? 'Connected' : 'Connecting…'}
+              </span>
+            </div>
           </div>
+
         </div>
 
         {users.length > 0 && (
@@ -449,7 +543,7 @@ function Room() {
       <main className="flex-1">
         <Editor
           height="100%"
-          defaultLanguage="javascript"
+          language={language}
           theme="vs-dark"
           value={code}
           onChange={handleChange}
@@ -463,10 +557,20 @@ function Room() {
             }, 50)
 
             editor.onDidChangeCursorPosition((e) => {
+              if (applyingRemote.current) return
               emitCursor({
                 lineNumber: e.position.lineNumber,
                 column: e.position.column,
               })
+            })
+
+
+            // Monaco wipes the decorations collection when the buffer is
+            // replaced (which happens whenever a remote code-change updates
+            // value via React). Re-apply decorations after every model change
+            // so remote cursors don't end up stuck at the bottom of the file.
+            editor.onDidChangeModelContent(() => {
+              renderCursors()
             })
 
             // If cursor events arrived before the editor finished mounting,
