@@ -22,4 +22,9 @@ services:
         sync: false
       - key: MONGODB_URI
         sync: false
+      - key: JDOODLE_CLIENT_ID
+        sync: false
+      - key: JDOODLE_CLIENT_SECRET
+        sync: false
+
 

@@ -120,9 +120,42 @@ function Room() {
     '// Loading…\n'
   )
 
+  const [executing, setExecuting] = useState(false)
+  const [stdin, setStdin] = useState('')
+  const [result, setResult] = useState(null)
+  const [runError, setRunError] = useState(null)
+  const [activeTab, setActiveTab] = useState('output') // 'output' | 'stdin'
+
   useEffect(() => {
     languageRef.current = language
   }, [language])
+
+  const renderCursors = useCallback(() => {
+    const editor = editorRef.current
+    const collection = decorationsRef.current
+    const monaco = monacoRef.current
+    if (!editor || !collection || !monaco) return
+
+    const decorations = []
+
+    for (const [remoteId, pos] of remoteCursorsRef.current.entries()) {
+      const colorIndex = colorIndexForSocket(remoteId)
+      decorations.push({
+        range: new monaco.Range(
+          pos.lineNumber,
+          pos.column,
+          pos.lineNumber,
+          pos.column
+        ),
+        options: {
+          beforeContentClassName: `remote-cursor remote-cursor-${colorIndex}`,
+          stickiness:
+            monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+        },
+      })
+    }
+    collection.set(decorations)
+  }, [])
 
   // Probe the room before connecting. Determines whether to connect
   // immediately (public / cached password) or show a password prompt first.
@@ -163,7 +196,7 @@ function Room() {
           setStatus('connecting')
           setConnectKey((k) => k + 1)
         }
-      } catch (err) {
+      } catch {
         if (cancelled) return
         setErrorMessage('Failed to load room')
         setStatus('error')
@@ -229,6 +262,8 @@ function Room() {
       }
 
       setLanguage(newLang)
+      setResult(null)         // ← add
+      setRunError(null)       // ← add
       setCode((prev) => {
         if (prev === newCode) return prev
         applyingRemote.current = true
@@ -292,6 +327,12 @@ function Room() {
       renderCursors()
     })
 
+    socket.on('execution-result', (data) => {
+      setResult(data)
+      setRunError(null)
+      setActiveTab('output')
+    })
+
     socket.on('disconnect', () => {
       setConnected(false)
       setSocketId(null)
@@ -304,34 +345,7 @@ function Room() {
       socket.disconnect()
       socketRef.current = null
     }
-  }, [connectKey, roomId])
-
-    const renderCursors = useCallback(() => {
-    const editor = editorRef.current
-    const collection = decorationsRef.current
-    const monaco = monacoRef.current
-    if (!editor || !collection || !monaco) return
-
-    const decorations = []
-
-    for (const [remoteId, pos] of remoteCursorsRef.current.entries()) {
-      const colorIndex = colorIndexForSocket(remoteId)
-      decorations.push({
-        range: new monaco.Range(
-          pos.lineNumber,
-          pos.column,
-          pos.lineNumber,
-          pos.column
-        ),
-        options: {
-          beforeContentClassName: `remote-cursor remote-cursor-${colorIndex}`,
-          stickiness:
-            monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-        },
-      })
-    }
-    collection.set(decorations)
-}, [])
+  }, [connectKey, roomId, renderCursors])
 
   const handleChange = (value) => {
     const newCode = value ?? ''
@@ -353,6 +367,47 @@ function Room() {
     socketRef.current?.emit('code-change', { roomId, code: newCode, language: languageRef.current })
   }
 
+  const handleRun = async () => {
+    if (executing || !connected || !socketId) return
+
+    setExecuting(true)
+    setRunError(null)
+
+    try {
+      const res = await fetch(`${SERVER_URL}/api/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId,
+          language: languageRef.current,
+          code,
+          stdin,
+          socketId,
+        }),
+      })
+
+      if (res.status === 429) {
+        const data = await res.json().catch(() => ({}))
+        const wait = Math.ceil((data.waitMs ?? 1000) / 100) / 10
+        setRunError(`Cooldown — try again in ${wait}s.`)
+      } else if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        if (data.error === 'daily-limit-reached') {
+          setRunError("Daily execution limit reached. Try again tomorrow.")
+        } else {
+          setRunError(data.error || `Run failed (${res.status})`)
+        }
+      }else {
+        const data = await res.json()
+        setResult(data)
+        setActiveTab('output')
+      }
+    } catch {
+      setRunError('Network error — could not reach server.')
+    } finally {
+      setExecuting(false)
+    }
+  }
 
   const handlePasswordSubmit = (e) => {
     e.preventDefault()
@@ -498,6 +553,14 @@ function Room() {
               ))}
             </select>
 
+            <button
+              onClick={handleRun}
+              disabled={executing || !connected}
+              className="px-3 py-1 rounded bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed transition text-white font-medium text-sm"
+            >
+              {executing ? 'Running…' : 'Run'}
+            </button>
+
             <div className="flex items-center gap-2">
               <span
                 className={`w-2 h-2 rounded-full ${
@@ -540,54 +603,119 @@ function Room() {
         )}
       </header>
 
-      <main className="flex-1">
-        <Editor
-          height="100%"
-          language={language}
-          theme="vs-dark"
-          value={code}
-          onChange={handleChange}
-          onMount={(editor, monaco) => {
-            editorRef.current = editor
-            monacoRef.current = monaco
-            decorationsRef.current = editor.createDecorationsCollection([])
+      <main className="flex-1 flex flex-col min-h-0">
+        <div className="flex-1 min-h-0">
+          <Editor
+            height="100%"
+            language={language}
+            theme="vs-dark"
+            value={code}
+            onChange={handleChange}
+            onMount={(editor, monaco) => {
+              editorRef.current = editor
+              monacoRef.current = monaco
+              decorationsRef.current = editor.createDecorationsCollection([])
 
-            const emitCursor = createCursorThrottle((position) => {
-              socketRef.current?.emit('cursor-move', { roomId, position })
-            }, 50)
+              const emitCursor = createCursorThrottle((position) => {
+                socketRef.current?.emit('cursor-move', { roomId, position })
+              }, 50)
 
-            editor.onDidChangeCursorPosition((e) => {
-              if (applyingRemote.current) return
-              emitCursor({
-                lineNumber: e.position.lineNumber,
-                column: e.position.column,
+              editor.onDidChangeCursorPosition((e) => {
+                if (applyingRemote.current) return
+                emitCursor({
+                  lineNumber: e.position.lineNumber,
+                  column: e.position.column,
+                })
               })
-            })
 
+              editor.onDidChangeModelContent(() => {
+                renderCursors()
+              })
 
-            // Monaco wipes the decorations collection when the buffer is
-            // replaced (which happens whenever a remote code-change updates
-            // value via React). Re-apply decorations after every model change
-            // so remote cursors don't end up stuck at the bottom of the file.
-            editor.onDidChangeModelContent(() => {
               renderCursors()
-            })
+            }}
+            options={{
+              fontSize: 14,
+              minimap: { enabled: false },
+              scrollBeyondLastLine: false,
+              automaticLayout: true,
+              padding: { top: 12 },
+              readOnly: status !== 'connected',
+            }}
+          />
+        </div>
 
-            // If cursor events arrived before the editor finished mounting,
-            // render them now.
-            renderCursors()
-          }}
+        <div className="h-72 border-t border-slate-800 flex flex-col bg-slate-900">
+          <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800">
+            <div className="flex gap-1">
+              <button
+                onClick={() => setActiveTab('output')}
+                className={`px-3 py-1 rounded text-sm font-medium transition ${
+                  activeTab === 'output'
+                    ? 'bg-slate-800 text-slate-100'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Output
+              </button>
+              <button
+                onClick={() => setActiveTab('stdin')}
+                className={`px-3 py-1 rounded text-sm font-medium transition ${
+                  activeTab === 'stdin'
+                    ? 'bg-slate-800 text-slate-100'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Stdin{stdin ? ` (${stdin.length})` : ''}
+              </button>
+            </div>
 
-          options={{
-            fontSize: 14,
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-            automaticLayout: true,
-            padding: { top: 12 },
-            readOnly: status !== 'connected',
-          }}
-        />
+            {result && activeTab === 'output' && (
+              <div className="text-xs text-slate-400">
+                <span>Run by </span>
+                <span className="text-slate-200 font-medium">{result.runBy.name}</span>
+                <span> · {result.executionTimeMs}ms · exit {result.exitCode}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="flex-1 overflow-auto">
+            {activeTab === 'output' ? (
+              runError ? (
+                <div className="p-4 text-rose-400 font-mono text-sm">{runError}</div>
+              ) : !result ? (
+                <div className="p-4 text-slate-500 italic text-sm">
+                  No runs yet. Hit Run to execute.
+                </div>
+              ) : (
+                <div className="p-3 font-mono text-sm">
+                  {result.stdout && (
+                    <pre className="text-slate-100 whitespace-pre-wrap">
+                      {result.stdout}
+                    </pre>
+                  )}
+                  {result.stderr && (
+                    <pre className="text-rose-400 whitespace-pre-wrap mt-2">
+                      {result.stderr}
+                    </pre>
+                  )}
+                  {!result.stdout && !result.stderr && (
+                    <div className="text-slate-500 italic">(empty output)</div>
+                  )}
+                </div>
+              )
+            ) : (
+              <textarea
+                value={stdin}
+                onChange={(e) => setStdin(e.target.value)}
+                placeholder="Input piped to your program on stdin. Local to your tab — not synced."
+                className="w-full h-full p-3 bg-slate-900 text-slate-100 font-mono text-sm focus:outline-none resize-none"
+              />
+            )}
+          </div>
+        </div>
       </main>
+
     </div>
   )
 }
