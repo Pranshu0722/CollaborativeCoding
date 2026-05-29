@@ -80,3 +80,75 @@ code, pre, kbd, samp {
 .remote-cursor-5 { background-color: #fb923c; } /* orange  */
 .remote-cursor-6 { background-color: #f472b6; } /* pink    */
 .remote-cursor-7 { background-color: #fb7185; } /* rose    */
+
+/* ====================================================================
+   Landing feature-card micro-animations. Light by design — three
+   small moments rather than a busy loop. Each respects
+   prefers-reduced-motion via the media query below.
+   ==================================================================== */
+
+/* Caret marching slowly to the right then resetting */
+@keyframes feature-caret {
+  0%, 100% { transform: translateX(0); opacity: 1; }
+  45%      { transform: translateX(56px); opacity: 1; }
+  50%      { transform: translateX(56px); opacity: 0; }
+  55%      { transform: translateX(0);   opacity: 0; }
+  60%      { transform: translateX(0);   opacity: 1; }
+}
+.feature-caret {
+  animation: feature-caret 4s ease-in-out infinite;
+}
+
+/* Pill row — cycle which pill is "active" by sliding the highlight */
+@keyframes feature-pill-shift {
+  0%   { left: 0%;  }
+  16%  { left: 17%; }
+  33%  { left: 34%; }
+  50%  { left: 51%; }
+  66%  { left: 68%; }
+  83%  { left: 85%; }
+  100% { left: 0%;  }
+}
+.feature-pill-highlight {
+  animation: feature-pill-shift 8s steps(1, end) infinite;
+}
+
+/* Run-by tag fading in */
+@keyframes feature-fade-in {
+  0%, 40%  { opacity: 0; transform: translateY(2px); }
+  60%, 100% { opacity: 1; transform: translateY(0); }
+}
+.feature-fade-in {
+  animation: feature-fade-in 3s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feature-caret,
+  .feature-pill-highlight,
+  .feature-fade-in {
+    animation: none;
+  }
+}
+
+/* ====================================================================
+   Modal entry — backdrop fade and panel scale-in. Triggered by the
+   .modal-enter classes when the React component mounts.
+   ==================================================================== */
+@keyframes modal-backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes modal-panel-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0)   scale(1);    }
+}
+.modal-backdrop-enter { animation: modal-backdrop-in 200ms ease-out; }
+.modal-panel-enter    { animation: modal-panel-in    200ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop-enter,
+  .modal-panel-enter {
+    animation: none;
+  }
+}
+
