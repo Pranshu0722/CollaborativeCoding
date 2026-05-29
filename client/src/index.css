@@ -1,10 +1,58 @@
 @import "tailwindcss";
 
-/* Remote cursor decorations.
-   Monaco renders these as zero-width inline elements at the cursor position.
-   We give them a fixed pixel width and negative margin so they look like
-   a thin vertical caret sitting *between* characters, matching the native
-   Monaco cursor's visual weight. */
+/* ====================================================================
+   Design tokens — semantic names that components actually use.
+   To retheme: change these variables, not the components.
+   ==================================================================== */
+@theme {
+  /* Type */
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+
+  /* Surface scale — bg layers from deepest to most-elevated */
+  --color-surface-base:   #09090b;  /* zinc-950, page background    */
+  --color-surface-1:      #18181b;  /* zinc-900, cards / header     */
+  --color-surface-2:      #27272a;  /* zinc-800, inputs / dropdowns */
+  --color-surface-3:      #3f3f46;  /* zinc-700, borders / dividers */
+
+  /* Text */
+  --color-text-strong:    #fafafa;  /* zinc-50,  headings / primary */
+  --color-text-default:   #d4d4d8;  /* zinc-300, body               */
+  --color-text-muted:     #71717a;  /* zinc-500, captions / labels  */
+  --color-text-subtle:    #52525b;  /* zinc-600, placeholders       */
+
+  /* Accent — emerald, used for action / "live" / connection-up */
+  --color-accent:         #10b981;  /* emerald-500, primary action  */
+  --color-accent-hover:   #34d399;  /* emerald-400                  */
+  --color-accent-soft:    #064e3b;  /* emerald-900, subtle backgrounds */
+
+  /* Status */
+  --color-status-good:    #10b981;  /* emerald-500                  */
+  --color-status-warn:    #f59e0b;  /* amber-500                    */
+  --color-status-bad:     #f43f5e;  /* rose-500                     */
+}
+
+/* ====================================================================
+   Base — apply Inter to the document, JetBrains Mono to <code>/<pre>.
+   Monaco editor manages its own font; we don't touch it.
+   ==================================================================== */
+html {
+  background-color: var(--color-surface-base);
+  color: var(--color-text-default);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
+}
+
+/* ====================================================================
+   Remote cursors. Carried over from Phase 6 — palette rebalanced to
+   sit on the new zinc background. Each color picked for contrast
+   against zinc-950 specifically.
+   ==================================================================== */
 .remote-cursor {
   display: inline-block;
   width: 2px;
@@ -24,13 +72,11 @@
   background-color: inherit;
 }
 
-
-
-.remote-cursor-0 { background-color: #818cf8; } /* indigo-400  */
-.remote-cursor-1 { background-color: #34d399; } /* emerald-400 */
-.remote-cursor-2 { background-color: #fbbf24; } /* amber-400   */
-.remote-cursor-3 { background-color: #f472b6; } /* pink-400    */
-.remote-cursor-4 { background-color: #22d3ee; } /* cyan-400    */
-.remote-cursor-5 { background-color: #a78bfa; } /* violet-400  */
-.remote-cursor-6 { background-color: #fb923c; } /* orange-400  */
-.remote-cursor-7 { background-color: #fb7185; } /* rose-400    */
+.remote-cursor-0 { background-color: #34d399; } /* emerald */
+.remote-cursor-1 { background-color: #22d3ee; } /* cyan    */
+.remote-cursor-2 { background-color: #fbbf24; } /* amber   */
+.remote-cursor-3 { background-color: #f472b6; } /* pink    */
+.remote-cursor-4 { background-color: #a78bfa; } /* violet  */
+.remote-cursor-5 { background-color: #fb923c; } /* orange  */
+.remote-cursor-6 { background-color: #f472b6; } /* pink    */
+.remote-cursor-7 { background-color: #fb7185; } /* rose    */
