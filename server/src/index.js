@@ -497,6 +497,18 @@ io.on('connection', (socket) => {
     })
   })
 
+  socket.on('update-name', ({ name } = {}) => {
+    const newName = String(name || '').trim().slice(0, 40) || 'Anonymous'
+
+    for (const roomId of socket.rooms) {
+      if (roomId === socket.id) continue
+      const roomPresence = presence.get(roomId)
+      if (!roomPresence?.has(socket.id)) continue
+      roomPresence.set(socket.id, { name: newName })
+      broadcastUsers(roomId)
+    }
+  })
+
   socket.on('disconnecting', () => {
     for (const roomId of socket.rooms) {
       if (roomId === socket.id) continue
