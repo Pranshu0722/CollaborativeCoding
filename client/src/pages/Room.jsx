@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { io } from 'socket.io-client'
 import Editor from '@monaco-editor/react'
+import * as Y from 'yjs'
+import { MonacoBinding } from 'y-monaco'
+import { SocketIOProvider } from '../yjs/SocketIOProvider'
 
 import RoomNav from '../components/RoomNav'
 import { ToastContainer, useToasts } from '../components/Toast'
@@ -87,7 +90,6 @@ function Room() {
   const { roomId } = useParams()
   const socketRef = useRef(null)
   const editorRef = useRef(null)
-  const applyingRemote = useRef(false)
   const mainRef = useRef(null)
   // socketId -> { lineNumber, column }. Imperative state — we don't want
   // React re-rendering on every remote keystroke; Monaco's decoration API
@@ -99,9 +101,15 @@ function Room() {
   // The monaco namespace itself — captured from onMount because
   // @monaco-editor/react doesn't expose it globally.
   const monacoRef = useRef(null)
+  // Suppressed during remote Yjs updates so the cursor listener doesn't
+  // echo a cursor position that was forced by a content change.
+  const applyingRemoteRef = useRef(false)
   // Password we'll submit on the next connection attempt. Held in a ref
   // so that mutating it doesn't itself trigger a re-render / reconnect.
   const passwordRef = useRef(null)
+  const ydocRef = useRef(null)
+  const yproviderRef = useRef(null)
+  const ybindingRef = useRef(null)
   // The socket listeners in the connection useEffect close over `language` at
   // the time the socket was created. To filter incoming code-changes by the
   // current language, we read through a ref that always points at the latest.
@@ -109,10 +117,6 @@ function Room() {
   // Ref to the latest handleRun. Monaco commands are registered once on
   // mount and would otherwise close over a stale handleRun.
   const handleRunRef = useRef(null)
-  // Cursor position captured right before a remote code-change lands.
-  // Restored in handleChange to undo the cursor drag Monaco does when its
-  // controlled `value` prop is updated.
-  const savedCursorPositionRef = useRef(null)
   // 'probing' | 'password-required' | 'connecting' | 'connected' | 'not-found' | 'error'
   const [status, setStatus] = useState('probing')
   const [errorMessage, setErrorMessage] = useState(null)
@@ -124,9 +128,6 @@ function Room() {
   const [socketId, setSocketId] = useState(null)
   const [users, setUsers] = useState([])
   const [language, setLanguage] = useState('javascript')
-  const [code, setCode] = useState(
-    '// Loading…\n'
-  )
 
   const { toasts, showToast } = useToasts()
   const [panelHeight, setPanelHeight] = useState(() => {
@@ -241,47 +242,61 @@ function Room() {
       })
     })
 
-    socket.on('init-room', ({ code: initialCode, language: initialLanguage }) => {
+    socket.on('init-room', ({ language: initialLanguage, yjsState }) => {
       setStatus('connected')
       setLanguage(initialLanguage)
-      setCode((current) => {
-        if (current === initialCode) return current
-        applyingRemote.current = true
-        return initialCode
+
+      const ydoc = new Y.Doc()
+      ydocRef.current = ydoc
+
+      const provider = new SocketIOProvider({
+        doc: ydoc,
+        socket,
+        roomId,
+        onBeforeApply: () => { applyingRemoteRef.current = true },
       })
-    })
+      yproviderRef.current = provider
 
-    socket.on('code-change', ({ code: newCode, language: incomingLang }) => {
-      // A peer who hasn't yet received our language-change may still be
-      // broadcasting edits authored in the old language. Ignore those.
-      if (incomingLang !== languageRef.current) return
-
-      const editor = editorRef.current
-      if (editor) {
-        savedCursorPositionRef.current = editor.getPosition()
+      applyingRemoteRef.current = true
+      if (yjsState) {
+        // Pass provider as origin so the `origin !== this` guard in
+        // SocketIOProvider suppresses emitting this initial state back
+        // to the server — it already has it.
+        Y.applyUpdate(ydoc, new Uint8Array(yjsState), provider)
       }
-      setCode((current) => {
-        if (current === newCode) return current
-        applyingRemote.current = true
-        return newCode
-      })
-    })
 
-    socket.on('language-change', ({ language: newLang, code: newCode }) => {
-      // Capture cursor before the buffer swaps — same dance as code-change.
       const editor = editorRef.current
       if (editor) {
-        savedCursorPositionRef.current = editor.getPosition()
+        const ytext = ydoc.getText(`code-${initialLanguage}`)
+        ybindingRef.current = new MonacoBinding(
+          ytext,
+          editor.getModel(),
+          new Set([editor]),
+        )
+      }
+      applyingRemoteRef.current = false
+    })
+
+    socket.on('language-change', ({ language: newLang }) => {
+      const editor = editorRef.current
+      const ydoc = ydocRef.current
+      const oldBinding = ybindingRef.current
+
+      if (editor && ydoc) {
+        oldBinding?.destroy()
+        applyingRemoteRef.current = true
+        const ytext = ydoc.getText(`code-${newLang}`)
+        ybindingRef.current = new MonacoBinding(
+          ytext,
+          editor.getModel(),
+          new Set([editor]),
+        )
+        applyingRemoteRef.current = false
       }
 
       setLanguage(newLang)
-      setResult(null)         // ← add
-      setRunError(null)       // ← add
-      setCode((prev) => {
-        if (prev === newCode) return prev
-        applyingRemote.current = true
-        return newCode
-      })
+      setResult(null)
+      setRunError(null)
 
       // Cursor positions captured under the old language's code don't make sense
       // in the new language's buffer. Drop them; remotes will re-emit on next move.
@@ -355,30 +370,15 @@ function Room() {
     })
 
     return () => {
+      ybindingRef.current?.destroy()
+      yproviderRef.current?.destroy()
+      ybindingRef.current = null
+      yproviderRef.current = null
+      ydocRef.current = null
       socket.disconnect()
       socketRef.current = null
     }
   }, [connectKey, roomId, renderCursors])
-
-  const handleChange = (value) => {
-    const newCode = value ?? ''
-    setCode(newCode)
-
-    if (applyingRemote.current) {
-      // Undo the cursor drag Monaco does when executeEdits replaces the model.
-      // We keep applyingRemote=true across setPosition so the cursor listener
-      // doesn't emit the shifted-then-restored intermediate position.
-      const editor = editorRef.current
-      if (editor && savedCursorPositionRef.current) {
-        editor.setPosition(savedCursorPositionRef.current)
-        savedCursorPositionRef.current = null
-      }
-      applyingRemote.current = false
-      return
-    }
-
-    socketRef.current?.emit('code-change', { roomId, code: newCode, language: languageRef.current })
-  }
 
   const handleRun = async () => {
     if (executing || !connected || !socketId) return
@@ -387,13 +387,16 @@ function Room() {
     setRunError(null)
 
     try {
+      const ydoc = ydocRef.current
+      const currentCode = ydoc?.getText(`code-${languageRef.current}`).toString() ?? ''
+
       const res = await fetch(`${SERVER_URL}/api/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           roomId,
           language: languageRef.current,
-          code,
+          code: currentCode,
           stdin,
           socketId,
         }),
@@ -664,8 +667,6 @@ function Room() {
             height="100%"
             language={language}
             theme="coderoom-dark"
-            value={code}
-            onChange={handleChange}
             onMount={(editor, monaco) => {
               editorRef.current = editor
               monacoRef.current = monaco
@@ -725,7 +726,10 @@ function Room() {
               }, 50)
 
               editor.onDidChangeCursorPosition((e) => {
-                if (applyingRemote.current) return
+                if (applyingRemoteRef.current) {
+                  applyingRemoteRef.current = false
+                  return
+                }
                 emitCursor({
                   lineNumber: e.position.lineNumber,
                   column: e.position.column,
