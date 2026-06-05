@@ -12,11 +12,12 @@ import * as Y from 'yjs'
  *   provider.destroy()
  */
 export class SocketIOProvider {
-  constructor({ doc, socket, roomId, onBeforeApply }) {
+  constructor({ doc, socket, roomId, onBeforeApply, onAfterApply }) {
     this.doc = doc
     this.socket = socket
     this.roomId = roomId
     this.onBeforeApply = onBeforeApply || null
+    this.onAfterApply = onAfterApply || null
 
     this._onUpdate = (update, origin) => {
       // `origin !== this` filters out updates we applied from remote,
@@ -32,6 +33,9 @@ export class SocketIOProvider {
     this._onRemoteUpdate = ({ update }) => {
       if (this.onBeforeApply) this.onBeforeApply()
       Y.applyUpdate(this.doc, new Uint8Array(update), this)
+      // Run afterApply on a microtask so any synchronous Monaco
+      // cursor event from the model update can fire first.
+      if (this.onAfterApply) queueMicrotask(this.onAfterApply)
     }
 
     this.doc.on('update', this._onUpdate)

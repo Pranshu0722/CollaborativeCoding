@@ -85,6 +85,18 @@ function createCursorThrottle(emit, intervalMs = 50) {
   }
 }
 
+// Creates or rebinds MonacoBinding between a Y.Text and the editor
+// model.  Safe to call multiple times — destroys any previous binding
+// stored in `bindingRef` first.
+function bindYjsToEditor(ydoc, language, editor, bindingRef) {
+  bindingRef.current?.destroy()
+  const ytext = ydoc.getText(`code-${language}`)
+  bindingRef.current = new MonacoBinding(
+    ytext,
+    editor.getModel(),
+    new Set([editor]),
+  )
+}
 
 function Room() {
   const { roomId } = useParams()
@@ -254,6 +266,7 @@ function Room() {
         socket,
         roomId,
         onBeforeApply: () => { applyingRemoteRef.current = true },
+        onAfterApply: () => { applyingRemoteRef.current = false },
       })
       yproviderRef.current = provider
 
@@ -265,14 +278,11 @@ function Room() {
         Y.applyUpdate(ydoc, new Uint8Array(yjsState), provider)
       }
 
+      // Editor might not be mounted yet if init-room arrives before
+      // onMount fires — the onMount callback handles this case.
       const editor = editorRef.current
       if (editor) {
-        const ytext = ydoc.getText(`code-${initialLanguage}`)
-        ybindingRef.current = new MonacoBinding(
-          ytext,
-          editor.getModel(),
-          new Set([editor]),
-        )
+        bindYjsToEditor(ydoc, initialLanguage, editor, ybindingRef)
       }
       applyingRemoteRef.current = false
     })
@@ -669,6 +679,11 @@ function Room() {
             theme="coderoom-dark"
             onMount={(editor, monaco) => {
               editorRef.current = editor
+              // If init-room already set up Yjs before the editor
+              // mounted, create the MonacoBinding now.
+              if (ydocRef.current && !ybindingRef.current) {
+                bindYjsToEditor(ydocRef.current, languageRef.current, editor, ybindingRef)
+              }
               monacoRef.current = monaco
               decorationsRef.current = editor.createDecorationsCollection([])
 

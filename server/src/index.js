@@ -570,8 +570,11 @@ io.on('connection', (socket) => {
       roomPresence.delete(socket.id)
       if (roomPresence.size === 0) {
         presence.delete(roomId)
-        // Last user left — persist Yjs state, then free the in-memory doc.
-        flushAllLanguages(roomId).then(() => yjsDocs.delete(roomId))
+        // Last user left — persist Yjs state, then free the doc only if
+        // nobody re-joined during the async DB write.
+        flushAllLanguages(roomId).then(() => {
+          if (!presence.has(roomId)) yjsDocs.delete(roomId)
+        })
       } else {
         broadcastUsers(roomId)
       }
