@@ -994,7 +994,7 @@ function ErrorPage({ message, onRetry }) {
             We couldn't load this room. The diagnostic might help:
           </p>
 
-          <div className="mb-7 px-4 py-3 rounded-lg bg-zinc-900 border border-zinc-800 font-mono text-sm text-zinc-300 text-left break-words">
+          <div className="mb-7 px-4 py-3 rounded-lg bg-zinc-900 border border-zinc-800 font-mono text-sm text-zinc-300 text-left wrap-break-word">
             {message || 'Unknown error'}
           </div>
 
