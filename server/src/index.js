@@ -6,6 +6,7 @@ import { Server } from 'socket.io'
 import mongoose from 'mongoose'
 import dns from 'node:dns'
 import bcrypt from 'bcryptjs'
+import * as Y from 'yjs'
 import Room from './models/Room.js'
 
 // Use public DNS resolvers for MongoDB Atlas SRV lookups.
@@ -310,19 +311,68 @@ const io = new Server(httpServer, {
   cors: { origin: ALLOWED_ORIGINS },
 })
 
-// Coalesce DB writes per (roomId, language). Keystrokes mutate the in-memory
-// buffer; a single timer per (roomId, language) flushes the latest code.
-const FLUSH_INTERVAL_MS = 1000
-const pendingWrites = new Map() // key -> { code, timer }
-
 // Per-room execute cooldown. Cheap defense in depth against runaway loops
 // or someone hammering the Run button; Piston's public tier has its own
 // rate limit too.
 const RUN_COOLDOWN_MS = 2000
 const lastRunAt = new Map() // roomId -> timestamp
 
-function pendingKey(roomId, language) {
-  return `${roomId}::${language}`
+// ===================================================================
+// Yjs CRDT — in-memory documents shared by all sockets in a room.
+// Each document contains one Y.Text type per supported language
+// ("code-javascript", "code-python", …).  When the last socket leaves
+// the room the document is persisted to MongoDB and freed.
+// ===================================================================
+const yjsDocs = new Map() // roomId -> Y.Doc
+
+function getOrCreateYjsDoc(roomId, initialCodeByLanguage = {}) {
+  let doc = yjsDocs.get(roomId)
+  if (!doc) {
+    doc = new Y.Doc()
+    yjsDocs.set(roomId, doc)
+
+    for (const lang of SUPPORTED_LANGUAGES) {
+      const code = initialCodeByLanguage[lang] || DEFAULT_CODE_BY_LANGUAGE[lang]
+      const text = doc.getText(`code-${lang}`)
+      if (text.toString() === '' && code) {
+        text.insert(0, code)
+      }
+    }
+  }
+  return doc
+}
+
+// Persist all language texts to MongoDB. Best-effort — failures are
+// logged but never crash the server.
+async function flushAllLanguages(roomId) {
+  const doc = yjsDocs.get(roomId)
+  if (!doc) return
+
+  const codeByLanguage = {}
+  for (const lang of SUPPORTED_LANGUAGES) {
+    codeByLanguage[lang] = doc.getText(`code-${lang}`).toString()
+  }
+
+  try {
+    await Room.findOneAndUpdate({ roomId }, { $set: { codeByLanguage } })
+  } catch (err) {
+    console.error(`  ✗ Failed to persist Yjs state for "${roomId}":`, err.message)
+  }
+}
+
+const persistTimers = new Map() // roomId -> Timeout
+
+function scheduleYjsPersist(roomId) {
+  if (persistTimers.has(roomId)) {
+    clearTimeout(persistTimers.get(roomId))
+  }
+  persistTimers.set(
+    roomId,
+    setTimeout(() => {
+      persistTimers.delete(roomId)
+      flushAllLanguages(roomId)
+    }, 2000),
+  )
 }
 
 // Presence: roomId -> Map<socketId, { name }>. Ephemeral; never persisted.
@@ -387,14 +437,6 @@ async function loadRoom(roomId) {
   return room
 }
 
-function getRoomCode(room, language) {
-  return (
-    room.codeByLanguage?.get(language) ??
-    DEFAULT_CODE_BY_LANGUAGE[language] ??
-    ''
-  )
-}
-
 io.on('connection', (socket) => {
   console.log(`✓ Client connected:    ${socket.id}`)
 
@@ -431,9 +473,19 @@ io.on('connection', (socket) => {
       presence.get(roomId).set(socket.id, { name: userName })
       broadcastUsers(roomId)
 
+      // Initialize (or retrieve) the in-memory Y.Doc for this room.
+      const codeMap = {}
+      if (room.codeByLanguage) {
+        for (const [lang, code] of room.codeByLanguage) {
+          codeMap[lang] = code
+        }
+      }
+      const doc = getOrCreateYjsDoc(roomId, codeMap)
+      const yjsState = Array.from(Y.encodeStateAsUpdate(doc))
+
       socket.emit('init-room', {
-        code: getRoomCode(room, room.language),
         language: room.language,
+        yjsState,
       })
     } catch (err) {
       console.error(`  ✗ Failed to join room "${roomId}":`, err.message)
@@ -441,16 +493,17 @@ io.on('connection', (socket) => {
     }
   })
 
-  socket.on('code-change', ({ roomId, code, language } = {}) => {
+  // Yjs CRDT update from a peer.  Apply it to the in-memory doc and
+  // forward to every other socket in the room.  The origin guard on the
+  // client prevents echo loops; we don't need to filter here.
+  socket.on('yjs-update', ({ roomId, update } = {}) => {
     if (!roomId || !socket.rooms.has(roomId)) return
-    if (typeof code !== 'string') return
-    if (!SUPPORTED_LANGUAGES.includes(language)) return
+    const doc = yjsDocs.get(roomId)
+    if (!doc || !update || update.length === 0) return
 
-    // Broadcast first for low latency. Include the language so peers can
-    // filter out edits authored under a now-stale language (race condition
-    // when someone switches language mid-typing).
-    socket.to(roomId).emit('code-change', { code, language })
-    schedulePersist(roomId, language, code)
+    Y.applyUpdate(doc, new Uint8Array(update))
+    socket.to(roomId).emit('yjs-update', { update })
+    scheduleYjsPersist(roomId)
   })
 
   socket.on('language-change', async ({ roomId, language } = {}) => {
@@ -460,15 +513,15 @@ io.on('connection', (socket) => {
     try {
       const room = await loadRoom(roomId)
       if (!room) return
-      if (room.language === language) return // no-op
+      if (room.language === language) return
 
       room.language = language
       await room.save()
 
-      io.to(roomId).emit('language-change', {
-        language,
-        code: getRoomCode(room, language),
-      })
+      // Yjs already syncs all language texts in the shared Y.Doc, so we
+      // only broadcast the language switch — every client already has the
+      // content for the new language via their local Y.Doc.
+      io.to(roomId).emit('language-change', { language })
     } catch (err) {
       console.error(`  ✗ language-change failed for "${roomId}":`, err.message)
     }
@@ -517,6 +570,8 @@ io.on('connection', (socket) => {
       roomPresence.delete(socket.id)
       if (roomPresence.size === 0) {
         presence.delete(roomId)
+        // Last user left — persist Yjs state, then free the in-memory doc.
+        flushAllLanguages(roomId).then(() => yjsDocs.delete(roomId))
       } else {
         broadcastUsers(roomId)
       }

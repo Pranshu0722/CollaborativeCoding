@@ -6,8 +6,8 @@ A real-time, web-based collaborative code editor. Multiple users join a room and
 
 ## Tech Stack
 
-**Frontend:** React (Vite) · Tailwind CSS · Monaco Editor · Socket.IO Client
-**Backend:** Node.js · Express.js · Socket.IO
+**Frontend:** React (Vite) · Tailwind CSS · Monaco Editor · Socket.IO Client · Yjs CRDT
+**Backend:** Node.js · Express.js · Socket.IO · Yjs CRDT
 **Database:** MongoDB Atlas
 **Code execution:** JDoodle compiler API (6 languages)
 **Hosting:** Vercel (frontend) · Render (backend)
@@ -23,17 +23,27 @@ Browser ──HTTPS──► Vercel (static React bundle)
 
 ```
 
-Room state is persisted to MongoDB Atlas, so a room's code survives server restarts and free-tier sleep cycles. Real-time edits are broadcast to all sockets in the room (excluding the sender) over WebSocket; DB writes are debounced at 1 write per (room, language) per second to avoid hammering the cluster on every keystroke. Late joiners get the current language's code via a `findOne` lookup on `join-room`.
+Room state is persisted to MongoDB Atlas, so a room's code survives server restarts and free-tier sleep cycles.
 
-Active users (presence) are tracked in-memory per room and broadcast to all sockets on join/leave — deliberately not persisted, since presence is ephemeral by definition. Names are prompted on the landing page and stored in `localStorage`; per-user avatar colors are derived deterministically from each socket's ID via a string hash, so every client agrees on who's which color without server coordination.
+### Real-time collaboration (Yjs CRDT)
 
-Rooms are created explicitly via `POST /api/rooms` with an optional password, which is bcrypt-hashed (cost factor 10) before storage — plaintext is never written or logged. Before opening a socket, the client probes `GET /api/rooms/:id` to learn whether the room exists and whether it needs a password; private rooms show an inline prompt, with the entered password cached in `sessionStorage` (tab-scoped) so the creator's immediate navigate and any in-tab reloads connect without re-prompting. Existing rooms from before this change remain public — `passwordHash` defaults to `null`.
+Instead of sending full text snapshots on every keystroke, the editor uses **Yjs**, a CRDT (Conflict-free Replicated Data Type) library. Each room has an in-memory `Y.Doc` on the server containing one `Y.Text` per supported language. Edits produce small binary patches that are broadcast via a dedicated `yjs-update` Socket.IO event; applying these patches on every client's local `Y.Doc` keeps the document in sync automatically, with **no lost edits** even when multiple users type at the exact same position.
 
-Live cursor positions are broadcast over a separate `cursor-move` socket event, throttled client-side to ~20 events per second to keep traffic bounded. Each remote caret renders as a thin colored line at the peer's exact line/column in the editor, in the same color as their avatar chip — derived from the same socket-ID hash, so cursor and chip always match without any server coordination. Cursor positions are never persisted, and prune automatically when a peer leaves.
+The `Y.Doc` is bound to Monaco Editor via `y-monaco/MonacoBinding`, which wires the editor's content model directly to the Y.Text type — the editor is uncontrolled and reacts to CRDT state changes. A lightweight custom `SocketIOProvider` transports Yjs updates over the existing Socket.IO connection, eliminating the need for a separate WebSocket server.
 
-Each room supports six languages (JavaScript, Python, C++, Java, Go, Rust) with **per-language code storage** — every language has its own independent draft, so switching language never destroys work (LeetCode model). The schema stores code as `codeByLanguage: Map<string, string>`; persistence is keyed by `(roomId, language)` so concurrent edits in different languages don't clobber each other. Legacy rooms from before the multi-language schema are lazily migrated into the new shape on first read. The `code-change` socket payload carries the originating language so peers can filter out edits authored under a now-stale language during a race-y switch (someone hitting a key while another peer is mid-`language-change`).
+For persistence, all language texts are read from the in-memory `Y.Doc` and written to MongoDB as plain text 2 seconds after the last update. When the last user leaves a room, the doc is persisted immediately and freed from memory, so rooms hydrate fresh from the database on the next join.
+
+### Room lifecycle
+
+Each room supports six languages (JavaScript, Python, C++, Java, Go, Rust) with **per-language code storage** — every language has its own independent draft, so switching language never destroys work (LeetCode model). The schema stores code as `codeByLanguage: Map<string, string>`. Legacy rooms from before the multi-language schema are lazily migrated into the new shape on first read.
+
+### Code execution
 
 Code execution runs through the [JDoodle compiler API](https://www.jdoodle.com/compiler-api). Clients POST `/api/execute` with `{ roomId, language, code, stdin, socketId }`; the server authorizes the caller's socket via Socket.IO's room membership map, enforces a 2-second per-room cooldown, calls JDoodle, and broadcasts the result via `execution-result` to other peers (the caller gets their copy through the HTTP response, so there's no double-fire). Stdin is local-only per tab — by design, not synced — letting different users test the same code against different inputs simultaneously. JDoodle merges stdout and stderr into one stream, so the output panel doesn't visually distinguish them. The free tier is 200 executions per day per `clientId`; on quota exhaustion the server returns HTTP 429 and the UI shows "Daily execution limit reached."
+
+### Live cursors
+
+Live cursor positions are broadcast over a separate `cursor-move` socket event (distinct from Yjs), throttled client-side to ~20 events per second to keep traffic bounded. Each remote caret renders as a thin colored line at the peer's exact line/column in the editor, in the same color as their avatar chip — derived from a deterministic hash of the socket ID, so cursor and chip always match without any server coordination. Cursor positions are never persisted and prune automatically when a peer leaves.
 
 ## Repository Layout
 
@@ -84,7 +94,7 @@ The free tier on Render sleeps after 15 minutes of inactivity; the first request
 - ✅ **Phase 5 (complete):** Password-protected rooms — optional bcrypt-hashed password at creation, REST endpoints for explicit room lifecycle, client probes before connecting.
 - ✅ **Phase 6 (complete):** Live cursor positions — each peer's caret renders in their avatar color, throttled to ~20 events per second, ephemeral (never persisted), prunes automatically on disconnect.
 - ✅ **Phase 7 (complete):** Multi-language support and code execution — per-language code storage (LeetCode model), Run button + stdin + shared output panel, six languages (JavaScript, Python, C++, Java, Go, Rust) via JDoodle.
-- 🚧 **Future:** Conflict-free editing (Yjs CRDT).
+- ✅ **Phase 8 (complete):** Conflict-free editing via Yjs CRDT — in-memory `Y.Doc` per room, `MonacoBinding` for editor sync, custom `SocketIOProvider` over existing Socket.IO, debounced persistence from Y.Text to MongoDB.
 
 ## License
 
